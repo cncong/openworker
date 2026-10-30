@@ -38,6 +38,9 @@ class AssistantTurn:
     # owning provider consumes its own key when converting history; every other
     # provider must strip or ignore foreign underscore keys before its wire call.
     extras: dict[str, Any] = field(default_factory=dict)
+    # Langfuse/OpenTelemetry usage details. Providers fill this on a best-effort basis
+    # from their SDK response objects so manual generation observations can track cost.
+    usage: dict[str, int] = field(default_factory=dict)
 
     @property
     def has_tool_calls(self) -> bool:

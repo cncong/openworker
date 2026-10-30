@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   addMcpServer,
   allowUser,
@@ -77,13 +77,48 @@ const EXAMPLE = `{
 // per-provider ModelChecklist / read-only model preview (form view).
 export function ModelsTab() {
   const [settings, setSettings] = useState<ModelSettings | null>(null);
-  const refreshSettings = () => getSettings().then(setSettings).catch(() => setSettings(null));
-  const ps = useProviderSetup({ onSaved: refreshSettings });
-  useEffect(() => {
-    refreshSettings();
+  const [settingsLoading, setSettingsLoading] = useState(true);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
+  const refreshSettings = useCallback(async (): Promise<boolean> => {
+    setSettingsLoading(true);
+    try {
+      setSettings(await getSettings());
+      setSettingsError(null);
+      return true;
+    } catch {
+      setSettingsError("Could not load model settings. Check that OpenWorker is running, then try again.");
+      return false;
+    } finally {
+      setSettingsLoading(false);
+    }
   }, []);
+  const ps = useProviderSetup({ onSaved: () => void refreshSettings() });
+  useEffect(() => {
+    let active = true;
+    let retry: number | null = null;
+    const load = async () => {
+      const ok = await refreshSettings();
+      if (active && !ok) retry = window.setTimeout(load, 1500);
+    };
+    void load();
+    return () => {
+      active = false;
+      if (retry !== null) window.clearTimeout(retry);
+    };
+  }, [refreshSettings]);
 
-  if (!settings) return <div className="text-[13px] text-muted">Loading…</div>;
+  if (!settings) {
+    if (settingsLoading && !settingsError) return <div className="text-[13px] text-muted">Loading…</div>;
+    return (
+      <div className={CARD + " p-4"} data-testid="models-settings-error">
+        <div className="text-[13px] font-medium text-ink">Model settings are not available</div>
+        <p className="text-[12px] text-muted mt-1.5 leading-relaxed">{settingsError}</p>
+        <button className={BTN_BORDERED + " mt-3"} onClick={() => void refreshSettings()} disabled={settingsLoading}>
+          {settingsLoading ? "Retrying…" : "Retry"}
+        </button>
+      </div>
+    );
+  }
 
   const info = ps.info;
   const knownNames = ps.providers.map((p) => p.name);

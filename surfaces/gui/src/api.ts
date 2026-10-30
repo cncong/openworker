@@ -2,17 +2,23 @@ import type { SessionInfo, WsEvent } from "./types";
 
 declare const __COWORKER_DEV_TOKEN__: string;
 
+const loopbackHost = (): string => {
+  const host = globalThis.location?.hostname;
+  return host === "localhost" || host === "127.0.0.1" ? host : "127.0.0.1";
+};
+
 // Endpoint resolution order: runtime-injected globals (Tauri sets `window.__COWORKER_HTTP__`
-// for its dynamically-chosen sidecar port) → Vite env → the 127.0.0.1:8765 dev default. This
-// keeps a single codebase: browser `npm run dev` hits 8765; the desktop shell hits its sidecar.
+// for its dynamically-chosen sidecar port) → Vite env → the current loopback hostname on
+// port 8765. Matching localhost-vs-127.0.0.1 to the page origin avoids needless CORS friction
+// in browser dev; the desktop shell still hits its injected sidecar URL.
 const httpBase = (): string =>
   (globalThis as any).__COWORKER_HTTP__ ||
   (import.meta as any).env?.VITE_COWORKER_HTTP ||
-  "http://127.0.0.1:8765";
+  `http://${loopbackHost()}:8765`;
 const wsBase = (): string =>
   (globalThis as any).__COWORKER_WS__ ||
   (import.meta as any).env?.VITE_COWORKER_WS ||
-  "ws://127.0.0.1:8765";
+  `ws://${loopbackHost()}:8765`;
 const apiToken = (): string =>
   (globalThis as any).__COWORKER_API_TOKEN__ ||
   (import.meta as any).env?.VITE_COWORKER_API_TOKEN ||

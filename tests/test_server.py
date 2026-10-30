@@ -466,6 +466,79 @@ def test_server_sets_explicit_websocket_frame_limit(tmp_path, monkeypatch):
     assert seen["ws_max_size"] == server_run._WS_MAX_FRAME_BYTES
 
 
+def test_server_loads_root_dotenv_before_start(tmp_path, monkeypatch):
+    import os
+    import sys
+    from types import SimpleNamespace
+
+    from coworker.server import run as server_run
+
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+    (tmp_path / ".env").write_text(
+        "LANGFUSE_PUBLIC_KEY=pk-lf-from-file\n"
+        "LANGFUSE_SECRET_KEY=sk-lf-from-file\n"
+        "LANGFUSE_BASE_URL=https://us.cloud.langfuse.com\n",
+        encoding="utf-8",
+    )
+    for key in (
+        "LANGFUSE_PUBLIC_KEY",
+        "LANGFUSE_SECRET_KEY",
+        "LANGFUSE_BASE_URL",
+        "COWORKER_ENV_FILE",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(server_run, "_ensure_ca_bundle", lambda: None)
+    monkeypatch.setattr(server_run, "_exit_when_orphaned", lambda: None)
+    monkeypatch.setattr(server_run, "build_app", lambda *args: object())
+    monkeypatch.setitem(
+        sys.modules,
+        "uvicorn",
+        SimpleNamespace(run=lambda *args, **kwargs: None),
+    )
+
+    server_run.main(["--cwd", str(tmp_path), "--port", "8767"])
+
+    assert os.environ["LANGFUSE_PUBLIC_KEY"] == "pk-lf-from-file"
+    assert os.environ["LANGFUSE_SECRET_KEY"] == "sk-lf-from-file"
+    assert os.environ["LANGFUSE_BASE_URL"] == "https://us.cloud.langfuse.com"
+
+
+def test_root_dotenv_does_not_override_real_env(tmp_path, monkeypatch):
+    import os
+
+    from coworker.dotenv import load_root_dotenv
+
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+    (tmp_path / ".env").write_text(
+        "LANGFUSE_PUBLIC_KEY=pk-lf-from-file\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-from-env")
+
+    loaded = load_root_dotenv(start=tmp_path)
+
+    assert loaded == tmp_path / ".env"
+    assert os.environ["LANGFUSE_PUBLIC_KEY"] == "pk-lf-from-env"
+
+
+def test_root_dotenv_can_use_explicit_env_file(tmp_path, monkeypatch):
+    import os
+
+    from coworker.dotenv import load_root_dotenv
+
+    env_file = tmp_path / "langfuse.env"
+    env_file.write_text(
+        "LANGFUSE_BASE_URL=https://cloud.langfuse.com\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("COWORKER_ENV_FILE", str(env_file))
+    monkeypatch.delenv("LANGFUSE_BASE_URL", raising=False)
+
+    loaded = load_root_dotenv(start=tmp_path / "missing")
+
+    assert loaded == env_file
+    assert os.environ["LANGFUSE_BASE_URL"] == "https://cloud.langfuse.com"
+
+
 def test_standalone_server_token_file_is_user_only(tmp_path, monkeypatch):
     import os
 
@@ -530,6 +603,23 @@ def test_cors_rejects_foreign_origin(tmp_path):
     # Localhost dev/browser build is allowed too.
     dev = client.get("/v1/sessions", headers={"Origin": "http://localhost:1420"})
     assert dev.headers.get("access-control-allow-origin") == "http://localhost:1420"
+    preflight = client.options(
+        "/v1/automations",
+        headers={
+            "Origin": "http://localhost:1420",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "x-openworker-token",
+        },
+    )
+    assert preflight.status_code == 200
+    assert (
+        preflight.headers.get("access-control-allow-origin")
+        == "http://localhost:1420"
+    )
+    assert (
+        preflight.headers.get("access-control-allow-headers")
+        == "x-openworker-token"
+    )
 
 
 def test_ws_rejects_foreign_origin(tmp_path):

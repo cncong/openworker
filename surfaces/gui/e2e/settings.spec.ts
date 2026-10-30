@@ -71,6 +71,30 @@ test("Models: provider gallery states; vendor form previews models", async ({ pa
   await expect(page.getByTestId("set-provider-openai")).toBeVisible();
 });
 
+test("Models: settings load failure shows recovery state and retries", async ({ page }) => {
+  let failNextSettings = false;
+  await page.route("**/v1/settings", async (route) => {
+    if (route.request().method() === "GET" && failNextSettings) {
+      failNextSettings = false;
+      await route.abort();
+      return;
+    }
+    await route.fallback();
+  });
+
+  await page.goto("/");
+  await page.getByTestId("account-row").click();
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  failNextSettings = true;
+  await page.getByRole("button", { name: "Models", exact: true }).click();
+
+  await expect(page.getByTestId("models-settings-error")).toContainText(
+    "Model settings are not available",
+  );
+  await expect(page.getByTestId("set-provider-openai")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByTestId("models-settings-error")).toHaveCount(0);
+});
+
 // UX-021: a configured provider's form shows the in-field saved state and the Remove key…
 // affordance; removing reverts the card to "Not set up".
 test("Models: Remove key reverts a configured provider", async ({ page }) => {

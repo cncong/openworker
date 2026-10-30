@@ -338,6 +338,26 @@ def _thinking_extras(thinking_blocks: list[dict[str, Any]]) -> dict[str, Any]:
     return {"_anthropic": {"blocks": thinking_blocks}} if thinking_blocks else {}
 
 
+def _usage_details(usage: Any) -> dict[str, int]:
+    if usage is None:
+        return {}
+    mapping = {
+        "input_tokens": "input_tokens",
+        "output_tokens": "output_tokens",
+        "cache_read_input_tokens": "cached_input_tokens",
+        "cache_creation_input_tokens": "cache_creation_input_tokens",
+    }
+    out = {}
+    for source, target in mapping.items():
+        value = getattr(usage, source, None)
+        if isinstance(value, int):
+            out[target] = value
+    total = out.get("input_tokens", 0) + out.get("output_tokens", 0)
+    if total:
+        out["total_tokens"] = total
+    return out
+
+
 class AnthropicProvider(ProviderClient):
     def __init__(
         self,
@@ -474,6 +494,7 @@ class AnthropicProvider(ProviderClient):
             raw=response,
             reasoning=_reasoning_text(thinking_blocks),
             extras=_thinking_extras(thinking_blocks),
+            usage=_usage_details(getattr(response, "usage", None)),
         )
 
     def capabilities(self, model: str) -> ModelCapabilities:
@@ -507,10 +528,12 @@ class AnthropicProvider(ProviderClient):
         # so both the text and the signature_delta tail are collected (in block order).
         thinking_accum: dict[int, dict[str, Any]] = {}
         stop_reason = None
+        usage: dict[str, int] = {}
 
         last_message_delta: Any = None
         for event in events:
             kind = getattr(event, "type", None)
+            usage.update(_usage_details(getattr(event, "usage", None)))
             if kind == "content_block_start":
                 block = getattr(event, "content_block", None)
                 block_kind = getattr(block, "type", None)
@@ -558,6 +581,7 @@ class AnthropicProvider(ProviderClient):
                         )
             elif kind == "message_delta":
                 last_message_delta = getattr(event, "delta", None)
+                usage.update(_usage_details(getattr(last_message_delta, "usage", None)))
                 reason = getattr(last_message_delta, "stop_reason", None)
                 if reason:
                     stop_reason = reason
@@ -580,5 +604,6 @@ class AnthropicProvider(ProviderClient):
                 finish_reason=_STOP_REASON_MAP.get(stop_reason, stop_reason),
                 reasoning=_reasoning_text(thinking_blocks),
                 extras=_thinking_extras(thinking_blocks),
+                usage=usage,
             )
         )

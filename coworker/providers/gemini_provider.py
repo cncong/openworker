@@ -323,6 +323,25 @@ def _signature_extras(
     return {"_gemini": {"text_sig": text_sig, "call_sigs": call_sigs}}
 
 
+def _usage_details(response: Any) -> dict[str, int]:
+    usage = getattr(response, "usage_metadata", None)
+    if usage is None:
+        return {}
+    mapping = {
+        "prompt_token_count": "input_tokens",
+        "candidates_token_count": "output_tokens",
+        "total_token_count": "total_tokens",
+        "cached_content_token_count": "cached_input_tokens",
+        "thoughts_token_count": "reasoning_tokens",
+    }
+    out = {}
+    for source, target in mapping.items():
+        value = getattr(usage, source, None)
+        if isinstance(value, int):
+            out[target] = value
+    return out
+
+
 @dataclass
 class _Parsed:
     """One GenerateContentResponse (or streamed chunk), split into our concerns."""
@@ -467,6 +486,7 @@ class GeminiProvider(ProviderClient):
             raw=response,
             reasoning="".join(parsed.thoughts) or None,
             extras=_signature_extras(parsed.text_sig, parsed.call_sigs),
+            usage=_usage_details(response),
         )
 
     def capabilities(self, model: str) -> ModelCapabilities:
@@ -491,10 +511,12 @@ class GeminiProvider(ProviderClient):
         finish = None
         text_sig: Optional[str] = None
         call_sigs: list[Optional[str]] = []
+        usage: dict[str, int] = {}
 
         # Unlike Anthropic, function_call parts arrive whole (args are a complete dict per
         # part), so there is no JSON accumulation — just collect parts across chunks.
         for chunk in client.models.generate_content_stream(**kwargs):
+            usage.update(_usage_details(chunk))
             parsed = _parse_candidate(chunk)
             for thought in parsed.thoughts:
                 thought_parts.append(thought)
@@ -520,5 +542,6 @@ class GeminiProvider(ProviderClient):
                 finish_reason=_map_finish(finish, bool(tool_calls)),
                 reasoning="".join(thought_parts) or None,
                 extras=_signature_extras(text_sig, call_sigs),
+                usage=usage,
             )
         )

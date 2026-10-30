@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 # Origins allowed to talk to the local sidecar. It binds to 127.0.0.1, but a page in the
@@ -40,6 +39,20 @@ _ALLOWED_ORIGIN_RE = re.compile(
 def _origin_allowed(origin: str | None) -> bool:
     """True if a browser Origin may use the API. Missing Origin (non-browser) passes."""
     return origin is None or bool(_ALLOWED_ORIGIN_RE.match(origin))
+
+
+def _cors_headers(origin: str, request_headers: str = "") -> dict[str, str]:
+    headers = {
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Methods": "DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT",
+        "Access-Control-Max-Age": "600",
+        "Vary": "Origin",
+    }
+    if request_headers:
+        headers["Access-Control-Allow-Headers"] = request_headers
+    else:
+        headers["Access-Control-Allow-Headers"] = "*"
+    return headers
 
 
 # Caps on inbound WebSocket traffic. The loopback socket is unauthenticated (any local
@@ -206,6 +219,30 @@ def create_app(manager: SessionManager) -> FastAPI:
         return any(secrets.compare_digest(part, api_token) for part in protocols)
 
     @app.middleware("http")
+    async def local_cors(request: Request, call_next):
+        # Starlette's generic CORS middleware is a little too implicit for a loopback app whose
+        # GUI may use either localhost or 127.0.0.1. Always echo the browser's allowed Origin,
+        # never the API Host, so dev origins like http://localhost:1420 pass preflight cleanly.
+        origin = request.headers.get("origin")
+        if origin and not _origin_allowed(origin):
+            return await call_next(request)
+        if origin and request.method == "OPTIONS" and request.headers.get(
+            "access-control-request-method"
+        ):
+            return JSONResponse(
+                {},
+                headers=_cors_headers(
+                    origin,
+                    request.headers.get("access-control-request-headers", ""),
+                ),
+            )
+        response = await call_next(request)
+        if origin:
+            for key, value in _cors_headers(origin).items():
+                response.headers[key] = value
+        return response
+
+    @app.middleware("http")
     async def require_sidecar_token(request: Request, call_next):
         # Preflights carry the requested header name, not its value. CORS checks the
         # Origin; the actual state-changing request still must authenticate.
@@ -221,14 +258,6 @@ def create_app(manager: SessionManager) -> FastAPI:
             status_code=401,
         )
 
-    app.add_middleware(
-        CORSMiddleware,
-        # Pinned to the desktop webview + localhost (see _ALLOWED_ORIGIN_RE): stops a random
-        # website the user visits from reading local API responses cross-origin.
-        allow_origin_regex=_ALLOWED_ORIGIN_RE.pattern,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
     app.state.manager = manager
 
     @app.get("/v1/health")

@@ -87,6 +87,16 @@ The standalone server creates a per-launch token at
 For direct API calls, send its value in the `X-OpenWorker-Token` header. The
 desktop app uses an in-memory launch token instead and never writes it to disk.
 
+### Langfuse tracing
+
+Set `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and `LANGFUSE_BASE_URL` (or
+`LANGFUSE_HOST`) in the repository-root `.env` before starting `openworker-server`
+to trace agent turns in Langfuse. Real environment variables take priority over
+`.env`, and `COWORKER_ENV_FILE=/path/to/.env` can point the server at a different
+file. Each user turn is an `agent` trace with nested `generation` and `tool`
+observations, grouped by the OpenWorker session id. Set
+`LANGFUSE_TRACING_ENABLED=false` to disable tracing without changing the keys.
+
 To run the full desktop app instead of the browser UI, replace step 3 with `npm run tauri dev` (from `surfaces/gui/`) - the Tauri shell launches the window and supervises the server itself.
 
 Tests: `.venv/bin/pytest` (server), `npm test` and `npm run e2e` in `surfaces/gui` (GUI unit + hermetic end-to-end). Desktop bundles are built with `packaging/build_dmg.sh` / `packaging/build_windows.ps1`.

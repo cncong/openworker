@@ -13,6 +13,7 @@ engine says `needs_user`, the engine emits `PERMISSION_REQUIRED` and awaits the 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from .events import Event, EventType
 from .permissions import Mode, PermissionEngine
 from .providers import AssistantTurn, ProviderClient, ToolCall
 from .providers.errors import friendly_model_error
+from . import tracing as lf_tracing
 from .tools import ToolRegistry
 
 
@@ -104,6 +106,10 @@ class TurnEngine:
         # that can't ask (the tool then no-ops).
         self.question_asker = question_asker
         self.audit_context: dict[str, Any] = {}
+        self._trace: lf_tracing.TurnTrace | lf_tracing.NoopTurnTrace = (
+            lf_tracing.NoopTurnTrace()
+        )
+        self._tool_traces: dict[str, lf_tracing.Observation | lf_tracing.NoopObservation] = {}
         if instructions and not (
             self.messages and self.messages[0].get("role") == "system"
         ):
@@ -153,29 +159,59 @@ class TurnEngine:
         self._steering.append((text, source))
 
     # -- main loop --------------------------------------------------------------
+    @contextlib.contextmanager
+    def _turn_trace(
+        self,
+        operation: str,
+        user_input: Any,
+        source: Optional[dict[str, Any]] = None,
+    ):
+        previous = self._trace
+        trace = lf_tracing.start_turn_trace(
+            operation=operation,
+            user_input=user_input,
+            session_id=str(self.audit_context.get("session_id") or ""),
+            agent=str(
+                self.audit_context.get("agent")
+                or getattr(self, "agent_name", "")
+                or "agent"
+            ),
+            workspace=str(self.audit_context.get("workspace") or ""),
+            model=self.model,
+            mode=getattr(self.permissions.mode, "value", str(self.permissions.mode)),
+            source=source,
+        )
+        with trace as active:
+            self._trace = active
+            try:
+                yield active
+            finally:
+                self._trace = previous
+
     async def run(
         self, user_input: "str | list", *, source: Optional[dict[str, Any]] = None
     ) -> AsyncIterator[Event]:
-        # `user_input` is a string, or OpenAI content-parts (text + image_url) for attachments.
-        # `source` (a MessageSource dict) is a display-only sidecar for connector messages: it
-        # rides on the persisted user message + the TURN_START event, but is stripped before the
-        # message reaches a provider (see `_outbound_messages`). `content` stays the framed text.
-        # `ts` (unix seconds, stamped on every appended message) is the same kind of sidecar.
-        message: dict[str, Any] = {
-            "role": "user",
-            "content": user_input,
-            "ts": time.time(),
-        }
-        if source is not None:
-            message["source"] = source
-        self.messages.append(message)
-        self._cancel.clear()
-        data: dict[str, Any] = {"input": user_input}
-        if source is not None:
-            data["source"] = source
-        yield Event(EventType.TURN_START, data)
-        async for event in self._loop():
-            yield event
+        with self._turn_trace("run", user_input, source):
+            # `user_input` is a string, or OpenAI content-parts (text + image_url) for attachments.
+            # `source` (a MessageSource dict) is a display-only sidecar for connector messages: it
+            # rides on the persisted user message + the TURN_START event, but is stripped before the
+            # message reaches a provider (see `_outbound_messages`). `content` stays the framed text.
+            # `ts` (unix seconds, stamped on every appended message) is the same kind of sidecar.
+            message: dict[str, Any] = {
+                "role": "user",
+                "content": user_input,
+                "ts": time.time(),
+            }
+            if source is not None:
+                message["source"] = source
+            self.messages.append(message)
+            self._cancel.clear()
+            data: dict[str, Any] = {"input": user_input}
+            if source is not None:
+                data["source"] = source
+            yield Event(EventType.TURN_START, data)
+            async for event in self._loop():
+                yield event
 
     def switch_model(self, model: str) -> Optional[str]:
         """Rebind the session's model mid-conversation (roadmap item 3). History is
@@ -242,10 +278,11 @@ class TurnEngine:
         is the intended recovery path (owner-hit 2026-07-23)."""
         if not self._tail_is_retriable_error():
             return
-        self._cancel.clear()
-        yield Event(EventType.TURN_START, {"input": ""})
-        async for event in self._loop():
-            yield event
+        with self._turn_trace("retry", self._last_user_input()):
+            self._cancel.clear()
+            yield Event(EventType.TURN_START, {"input": ""})
+            async for event in self._loop():
+                yield event
 
     async def resume(self) -> AsyncIterator[Event]:
         """Continue a turn that was suspended at a prompt and persisted — durable resume after a
@@ -256,14 +293,21 @@ class TurnEngine:
         pending = self._unanswered_trailing_tool_calls()
         if not pending:
             return
-        self._cancel.clear()
-        yield Event(EventType.TURN_START, {"input": "(resumed)"})
-        async for event in self._handle_tool_calls(pending):
-            yield event
-        yield Event(EventType.ITERATION_END, {"iteration": 0})
-        if not self._cancel.is_set():
-            async for event in self._loop():
+        with self._turn_trace("resume", "(resumed)"):
+            self._cancel.clear()
+            yield Event(EventType.TURN_START, {"input": "(resumed)"})
+            async for event in self._handle_tool_calls(pending):
                 yield event
+            yield Event(EventType.ITERATION_END, {"iteration": 0})
+            if not self._cancel.is_set():
+                async for event in self._loop():
+                    yield event
+
+    def _last_user_input(self) -> Any:
+        for message in reversed(self.messages):
+            if message.get("role") == "user":
+                return message.get("content") or ""
+        return ""
 
     def _unanswered_trailing_tool_calls(self) -> list[ToolCall]:
         """The tool-calls of the last assistant message that don't yet have a tool result —
@@ -295,6 +339,10 @@ class TurnEngine:
         iterations = 0
         while True:
             if iterations >= self.max_iterations:
+                self._trace.update(
+                    output={"status": "max_iterations_exceeded"},
+                    metadata={"status": "max_iterations_exceeded", "iterations": iterations},
+                )
                 yield Event(
                     EventType.TURN_END,
                     {"status": "max_iterations_exceeded", "iterations": iterations},
@@ -341,6 +389,10 @@ class TurnEngine:
                 if friendly:
                     payload["raw"] = str(exc)
                 self._append_notice("error", friendly or str(exc))
+                self._trace.update(
+                    output=payload,
+                    metadata={"status": "error", "error_type": type(exc).__name__},
+                )
                 yield Event(EventType.ERROR, payload)
                 return
             if self._cancel.is_set() and turn is None:
@@ -348,6 +400,10 @@ class TurnEngine:
                 if streamed or streamed_reasoning:
                     self.messages.append(_assistant_message(_partial_turn()))
                 self._append_notice("interrupted")
+                self._trace.update(
+                    output={"status": "interrupted", "partial": "".join(streamed)},
+                    metadata={"status": "interrupted", "iterations": iterations},
+                )
                 yield Event(EventType.INTERRUPTED, {"iterations": iterations})
                 return
             if turn is None:
@@ -366,6 +422,10 @@ class TurnEngine:
                 if self._steering:
                     self._inject_steering()
                     continue
+                self._trace.update(
+                    output=turn.text or "",
+                    metadata={"status": "completed", "iterations": iterations},
+                )
                 yield Event(
                     EventType.TURN_END,
                     {"status": "completed", "iterations": iterations},
@@ -379,6 +439,10 @@ class TurnEngine:
 
             if self._cancel.is_set():
                 self._append_notice("interrupted")
+                self._trace.update(
+                    output={"status": "interrupted"},
+                    metadata={"status": "interrupted", "iterations": iterations},
+                )
                 yield Event(EventType.INTERRUPTED, {"iterations": iterations})
                 return
             if self._steering:
@@ -397,6 +461,14 @@ class TurnEngine:
             self.model_settings,
         )
         provider = self.provider
+        generation = self._trace.start_generation(
+            model=model,
+            messages=messages,
+            tools=tools,
+            metadata={"message_count": len(messages), "settings": sorted(settings)},
+        )
+        final_turn: Optional[AssistantTurn] = None
+        provider_error: Optional[Exception] = None
 
         def produce():
             try:
@@ -414,25 +486,52 @@ class TurnEngine:
                 loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
 
         loop.run_in_executor(None, produce)
-        while True:
-            # Race the queue against Stop so a stalled stream (no chunks arriving —
-            # the pre-first-token wait, a wedged connection) can't hold the turn.
-            get_task = asyncio.ensure_future(queue.get())
-            cancel_task = asyncio.ensure_future(self._cancel.wait())
-            done, _ = await asyncio.wait(
-                {get_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED
-            )
-            cancel_task.cancel()
-            if get_task not in done:
-                get_task.cancel()
-                return  # interrupted — the producer exits on its own next chunk
-            kind, payload = get_task.result()
-            if kind == "chunk":
-                yield payload
-            elif kind == "error":
-                raise payload
+        try:
+            while True:
+                # Race the queue against Stop so a stalled stream (no chunks arriving —
+                # the pre-first-token wait, a wedged connection) can't hold the turn.
+                get_task = asyncio.ensure_future(queue.get())
+                cancel_task = asyncio.ensure_future(self._cancel.wait())
+                done, _ = await asyncio.wait(
+                    {get_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+                cancel_task.cancel()
+                if get_task not in done:
+                    get_task.cancel()
+                    return  # interrupted — the producer exits on its own next chunk
+                kind, payload = get_task.result()
+                if kind == "chunk":
+                    if payload.turn is not None:
+                        final_turn = payload.turn
+                    yield payload
+                elif kind == "error":
+                    provider_error = payload
+                    raise payload
+                else:
+                    return
+        finally:
+            if provider_error is not None:
+                generation.update(
+                    output={
+                        "error": str(provider_error),
+                        "error_type": type(provider_error).__name__,
+                    },
+                    metadata={"status": "error"},
+                ).end()
+            elif final_turn is not None:
+                generation.update(
+                    output=_turn_trace_output(final_turn),
+                    usage_details=final_turn.usage or None,
+                    metadata={
+                        "status": "ok",
+                        "finish_reason": final_turn.finish_reason or "",
+                    },
+                ).end()
             else:
-                return
+                generation.update(
+                    output={"status": "interrupted"},
+                    metadata={"status": "interrupted"},
+                ).end()
 
     async def _handle_tool_calls(
         self, tool_calls: list[ToolCall]
@@ -486,6 +585,7 @@ class TurnEngine:
             for tool_call in concurrent:
                 yield Event(EventType.TOOL_STARTED, {"name": tool_call.name})
                 self._audit(tool_call, stage="started")
+                self._start_tool_trace(tool_call)
             outcomes = await asyncio.gather(
                 *[asyncio.to_thread(self._execute_sync, tc) for tc in concurrent]
             )
@@ -498,8 +598,23 @@ class TurnEngine:
                 continue
             yield Event(EventType.TOOL_STARTED, {"name": tool_call.name})
             self._audit(tool_call, stage="started")
+            self._start_tool_trace(tool_call)
             result, status = await asyncio.to_thread(self._execute_sync, tool_call)
             yield self._record_result(tool_call, result, status)
+
+    def _start_tool_trace(self, tool_call: ToolCall) -> None:
+        self._tool_traces[tool_call.id] = self._trace.start_tool(
+            tool_call.name, tool_call.arguments
+        )
+
+    def _finish_tool_trace(self, tool_call: ToolCall, result: Any, status: str) -> None:
+        obs = self._tool_traces.pop(tool_call.id, None)
+        if obs is None:
+            return
+        obs.update(
+            output={"status": status, "result": result},
+            metadata={"status": status},
+        ).end()
 
     def _interrupted_tool(self, tool_call: ToolCall) -> Event:
         """The stop-path answer for a call that will not run: a tool-error result in the
@@ -508,6 +623,9 @@ class TurnEngine:
         self.messages.append(_tool_error_message(tool_call, "interrupted by user"))
         self._audit(
             tool_call, stage="finished", status="interrupted", reason="user stop"
+        )
+        self._finish_tool_trace(
+            tool_call, {"error": "interrupted by user"}, "interrupted"
         )
         return Event(
             EventType.TOOL_FINISHED,
@@ -675,6 +793,7 @@ class TurnEngine:
             result=result,
             result_preview=_preview(result),
         )
+        self._finish_tool_trace(tool_call, result, status)
         rule = self._standing_notes.pop(tool_call.id, "")
         return Event(
             EventType.TOOL_FINISHED,
@@ -707,6 +826,7 @@ class TurnEngine:
         going, with all its exploration context); rejection keeps plan mode and returns
         the user's feedback so the agent can revise."""
         args = tool_call.arguments or {}
+        self._start_tool_trace(tool_call)
         plan = str(args.get("plan", ""))
         if self.permissions.mode is not Mode.PLAN:
             # The tool is always registered (mode can flip mid-session), but proposing a
@@ -759,6 +879,7 @@ class TurnEngine:
             result=result,
             result_preview=_preview(result),
         )
+        self._finish_tool_trace(tool_call, result, status)
         yield Event(
             EventType.TOOL_FINISHED,
             {
@@ -774,6 +895,7 @@ class TurnEngine:
         """Emit the grant prompt, await the user's out-of-band decision (which the requester also
         applies to this session's roots), and return the outcome as the tool result."""
         args = tool_call.arguments or {}
+        self._start_tool_trace(tool_call)
         if self.directory_requester is None:
             result: dict[str, Any] = {
                 "granted": False,
@@ -810,6 +932,7 @@ class TurnEngine:
             result=result,
             result_preview=_preview(result),
         )
+        self._finish_tool_trace(tool_call, result, status)
         yield Event(
             EventType.TOOL_FINISHED,
             {
@@ -823,6 +946,7 @@ class TurnEngine:
         """Emit the question, await the user's out-of-band answer (inline in the live session or
         from the Inbox when unattended), and return it as the tool result."""
         args = tool_call.arguments or {}
+        self._start_tool_trace(tool_call)
         question = str(args.get("question", "")).strip()
         if self.question_asker is None or not question:
             result: dict[str, Any] = {
@@ -854,6 +978,7 @@ class TurnEngine:
             result=result,
             result_preview=_preview(result),
         )
+        self._finish_tool_trace(tool_call, result, status)
         yield Event(
             EventType.TOOL_FINISHED,
             {
@@ -1024,6 +1149,18 @@ def _tool_error_message(tool_call: ToolCall, reason: str) -> dict[str, Any]:
         "tool_call_id": tool_call.id,
         "content": json.dumps({"error": "tool call not executed", "reason": reason}),
         "ts": time.time(),
+    }
+
+
+def _turn_trace_output(turn: AssistantTurn) -> Any:
+    if not turn.tool_calls:
+        return turn.text or ""
+    return {
+        "text": turn.text or "",
+        "tool_calls": [
+            {"name": tc.name, "arguments": tc.arguments} for tc in turn.tool_calls
+        ],
+        "finish_reason": turn.finish_reason or "",
     }
 
 

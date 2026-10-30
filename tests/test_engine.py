@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 import time
 
 import aisuite as ai
+from coworker import tracing as lf_tracing
 from coworker.engine import ApprovalOutcome, PermissionRequest, TurnEngine
 from coworker.events import EventType
 from coworker.permissions import PermissionEngine
@@ -112,6 +114,82 @@ def test_tool_turn_order_and_execution(tmp_path):
     assert any(
         m.get("role") == "tool" and "hello" in m["content"] for m in engine.messages
     )
+
+
+def test_langfuse_trace_tree_for_tool_turn(tmp_path, monkeypatch):
+    class FakeObservation:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.updates = []
+            self.children = []
+            self.ended = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            self.ended = True
+
+        def start_observation(self, **kwargs):
+            child = FakeObservation(**kwargs)
+            self.children.append(child)
+            return child
+
+        def update(self, **kwargs):
+            self.updates.append(kwargs)
+            return self
+
+        def end(self):
+            self.ended = True
+
+    class FakeClient:
+        def __init__(self):
+            self.root = None
+
+        def start_as_current_observation(self, **kwargs):
+            self.root = FakeObservation(**kwargs)
+            return self.root
+
+        def flush(self):
+            pass
+
+    @contextlib.contextmanager
+    def fake_propagate(**_kwargs):
+        yield
+
+    fake = FakeClient()
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
+    monkeypatch.setenv("LANGFUSE_BASE_URL", "https://cloud.langfuse.com")
+    monkeypatch.setattr(lf_tracing, "_client", fake)
+    monkeypatch.setattr(lf_tracing, "_client_ready", True)
+    monkeypatch.setattr(lf_tracing, "_propagate_attributes", fake_propagate)
+
+    (tmp_path / "a.txt").write_text("hello", encoding="utf-8")
+    engine, _ = _engine(
+        tmp_path,
+        [_tool_turn("read_file", {"path": "a.txt"}), _text_turn("it says hello")],
+    )
+
+    _collect(engine, "read a.txt")
+
+    assert fake.root.kwargs["as_type"] == "agent"
+    assert fake.root.kwargs["name"] == "run-agent-turn"
+    assert fake.root.updates[-1]["output"] == "it says hello"
+    assert [child.kwargs["as_type"] for child in fake.root.children] == [
+        "generation",
+        "tool",
+        "generation",
+    ]
+    assert (
+        fake.root.children[0].updates[-1]["output"]["tool_calls"][0]["name"]
+        == "read_file"
+    )
+    assert fake.root.children[1].kwargs["input"] == {
+        "name": "read_file",
+        "arguments": {"path": "a.txt"},
+    }
+    assert fake.root.children[1].updates[-1]["output"]["status"] == "ok"
 
 
 def test_write_requires_approval_then_approved(tmp_path):

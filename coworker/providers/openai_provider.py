@@ -73,6 +73,26 @@ def _strip_foreign_sidecars(messages: list[dict[str, Any]]) -> list[dict[str, An
     ]
 
 
+def _usage_details(usage: Any) -> dict[str, int]:
+    if usage is None:
+        return {}
+    mapping = {
+        "prompt_tokens": "input_tokens",
+        "completion_tokens": "output_tokens",
+        "total_tokens": "total_tokens",
+    }
+    out = {}
+    for source, target in mapping.items():
+        value = getattr(usage, source, None)
+        if isinstance(value, int):
+            out[target] = value
+    prompt_details = getattr(usage, "prompt_tokens_details", None)
+    cached = getattr(prompt_details, "cached_tokens", None)
+    if isinstance(cached, int):
+        out["cached_input_tokens"] = cached
+    return out
+
+
 _MAX_TOKENS_ERROR = "'max_tokens' is not supported"
 
 
@@ -174,6 +194,7 @@ class OpenAIProvider(ProviderClient):
             finish_reason=getattr(choice, "finish_reason", None),
             raw=response,
             reasoning=_delta_reasoning(message),
+            usage=_usage_details(getattr(response, "usage", None)),
         )
 
     def capabilities(self, model: str) -> ModelCapabilities:
@@ -196,12 +217,17 @@ class OpenAIProvider(ProviderClient):
         if tools:
             kwargs["tools"] = tools
         _pin_reasoning_effort(kwargs)
+        if self._base_url is None:
+            stream_options = dict(kwargs.get("stream_options") or {})
+            stream_options.setdefault("include_usage", True)
+            kwargs["stream_options"] = stream_options
         client = self._ensure_client()
 
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
         tool_accum: dict[int, dict[str, str]] = {}
         finish_reason = None
+        usage: dict[str, int] = {}
 
         # Up to two param-fix retries: effort and max_tokens can BOTH need fixing.
         for _ in range(2):
@@ -213,6 +239,7 @@ class OpenAIProvider(ProviderClient):
         else:
             chunks = client.chat.completions.create(**kwargs)
         for chunk in chunks:
+            usage.update(_usage_details(getattr(chunk, "usage", None)))
             choices = getattr(chunk, "choices", None)
             if not choices:
                 continue
@@ -262,6 +289,7 @@ class OpenAIProvider(ProviderClient):
                 tool_calls=tool_calls,
                 finish_reason=finish_reason,
                 reasoning="".join(reasoning_parts) or None,
+                usage=usage,
             )
         )
 
